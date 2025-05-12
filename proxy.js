@@ -7,6 +7,9 @@ dotenv.config();
 const app  = express();
 const port = process.env.PORT || 3000;
 
+const unsupportedModels = ['o3-mini'];
+const unsupportedTemperatureModels = ['o3-mini'];
+
 app.use(express.json({ limit: '4mb' }));
 
 /* ----------------------------------------------------------------------------
@@ -90,8 +93,8 @@ function buildSAPBody (body) {
           model_version: 'latest',
           model_params: {
             max_tokens:  body.max_tokens  ?? 4096,
-            temperature: body.temperature ?? 0.7,
-            top_p:       body.top_p       ?? 1
+            ...(unsupportedTemperatureModels.includes(model) ? {} : { temperature: body.temperature ?? 0.7 }),
+            ...(unsupportedModels.includes(model) ? {} : { top_p: body.top_p ?? 1 })
           }
         }
       }
