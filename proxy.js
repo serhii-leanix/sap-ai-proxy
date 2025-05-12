@@ -55,7 +55,7 @@ function buildSAPBody (body) {
   };
 
   if (Array.isArray(body.messages)) {
-    /* OpenAI-chat формат (role/content) */
+    /* OpenAI-chat format (role/content) */
     if (body.messages.some(m => 'role' in m)) {
       prompt = body.messages
         .map(m =>
@@ -129,17 +129,34 @@ function streamOpenAI (res, fullText) {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  /* very naive tokenizer - by words */
-  const words = fullText.split(/\s+/);
+  const lines = fullText.split('\n'); // Split strictly by '\n'
 
-  for (let i = 0; i < words.length; i++) {
-    const delta = { id: 'sap-ai-core',
-                    choices: [{
-                      delta: { content: (i ? ' ' : '') + words[i] },
-                      index: 0,
-                      finish_reason: null
-                    }] };
-    res.write(`data: ${JSON.stringify(delta)}\n\n`);
+  for (let i = 0; i < lines.length; i++) {
+    const lineContent = lines[i];
+    // Send line content (if not empty)
+    if (lineContent) {
+      const deltaContent = { 
+        id: 'sap-ai-core',
+        choices: [{
+          delta: { content: lineContent },
+          index: 0,
+          finish_reason: null
+        }] 
+      };
+      res.write(`data: ${JSON.stringify(deltaContent)}\n\n`);
+    }
+    // If this is not the last line, send a newline character separately
+    if (i < lines.length - 1) {
+      const deltaNewline = { 
+        id: 'sap-ai-core',
+        choices: [{
+          delta: { content: '\n' },
+          index: 0,
+          finish_reason: null
+        }] 
+      };
+      res.write(`data: ${JSON.stringify(deltaNewline)}\n\n`);
+    }
   }
 
   /* final marker [DONE] */
@@ -174,11 +191,18 @@ async function handler (req, res) {
         sapRes.data.orchestration_result?.choices?.[0]?.message?.content
         ?? sapRes.data.orchestration_result?.text
         ?? '';
+
       streamOpenAI(res, text);
       return;
     }
 
-    res.json( toOpenAI(sapRes.data) );
+    // Final OpenAI response before sending
+    const openAIResponse = toOpenAI(sapRes.data);
+    console.log('--- Final OpenAI Response ---');
+    console.log(JSON.stringify(openAIResponse, null, 2));
+    console.log('-----------------------------');
+
+    res.json(openAIResponse);
 
   } catch (err) {
     console.error(err.response?.data || err.message);
