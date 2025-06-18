@@ -36,8 +36,8 @@ PORT=3000
 AICORE_SERVICE_KEY='{
     "clientid": "sb-****",
     "clientsecret": "9a4***",
-    "url": "https://****-ai-playbox-***.authentication.**.hana.ondemand.com",
-    "identityzone": "****-ai-playbox-***",
+    "url": "https://****-ai-***.authentication.**.hana.ondemand.com",
+    "identityzone": "****-ai-***",
     "identityzoneid": "****",
     "appname": "****",
     "credential-type": "binding-secret",
