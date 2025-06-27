@@ -353,8 +353,9 @@ async function handleChatCompletions(req, res) {
   try {
     const bearer = await getToken();
     
-    // Always use converse-stream endpoint
-    const endpoint = '/converse-stream';
+    // Check if streaming is requested
+    const isStreaming = req.body.stream === true;
+    const endpoint = isStreaming ? '/converse-stream' : '/converse';
     
     // Use the deployment URL defined at the top of the file
     if (!DEPLOYMENT_URL) {
@@ -364,53 +365,86 @@ async function handleChatCompletions(req, res) {
     // Convert OpenAI request format to Claude format
     const claudeBody = openAIToClaudeMessages(req.body);
     
-    
-    // Handle streaming response
-    try {
-      const streamResponse = await axios({
-        method: 'post',
-        url: `${DEPLOYMENT_URL}${endpoint}`,
-        data: claudeBody,
-        headers: {
-          'Authorization': `Bearer ${bearer}`,
-          'AI-Resource-Group': resourceGroup,
-          'Content-Type': 'application/json'
-        },
-        responseType: 'stream'
-      });
-      
-      streamClaudeToOpenAI(res, streamResponse.data);
-    } catch (streamError) {
-      console.error("Streaming error:", streamError.message);
-      
-      // Try to get more detailed error information
-      if (streamError.response) {
-        console.error("Response status:", streamError.response.status);
-        console.error("Response headers:", JSON.stringify(streamError.response.headers, null, 2));
+    if (isStreaming) {
+      // Handle streaming response
+      try {
+        const streamResponse = await axios({
+          method: 'post',
+          url: `${DEPLOYMENT_URL}${endpoint}`,
+          data: claudeBody,
+          headers: {
+            'Authorization': `Bearer ${bearer}`,
+            'AI-Resource-Group': resourceGroup,
+            'Content-Type': 'application/json'
+          },
+          responseType: 'stream'
+        });
         
-        // Log request that caused the error
-        console.error("Request URL:", `${DEPLOYMENT_URL}${endpoint}`);
-        console.error("Request data:", JSON.stringify(claudeBody, null, 2));
+        streamClaudeToOpenAI(res, streamResponse.data);
+      } catch (streamError) {
+        console.error("Streaming error:", streamError.message);
         
-        if (streamError.response.data) {
-          // Try to read the response data
-          if (typeof streamError.response.data === 'string') {
-            console.error("Response data:", streamError.response.data);
-          } else {
-            try {
-              const chunks = [];
-              streamError.response.data.on('data', chunk => chunks.push(chunk));
-              streamError.response.data.on('end', () => {
-                const buffer = Buffer.concat(chunks);
-                console.error("Response data:", buffer.toString());
-              });
-            } catch (e) {
-              console.error("Could not read response data:", e.message);
+        // Try to get more detailed error information
+        if (streamError.response) {
+          console.error("Response status:", streamError.response.status);
+          console.error("Response headers:", JSON.stringify(streamError.response.headers, null, 2));
+          
+          // Log request that caused the error
+          console.error("Request URL:", `${DEPLOYMENT_URL}${endpoint}`);
+          console.error("Request data:", JSON.stringify(claudeBody, null, 2));
+          
+          if (streamError.response.data) {
+            // Try to read the response data
+            if (typeof streamError.response.data === 'string') {
+              console.error("Response data:", streamError.response.data);
+            } else {
+              try {
+                const chunks = [];
+                streamError.response.data.on('data', chunk => chunks.push(chunk));
+                streamError.response.data.on('end', () => {
+                  const buffer = Buffer.concat(chunks);
+                  console.error("Response data:", buffer.toString());
+                });
+              } catch (e) {
+                console.error("Could not read response data:", e.message);
+              }
             }
           }
         }
+        res.status(500).send('Error in streaming: ' + streamError.message);
       }
-      res.status(500).send('Error in streaming: ' + streamError.message);
+    } else {
+      // Handle non-streaming response
+      try {
+        const response = await axios({
+          method: 'post',
+          url: `${DEPLOYMENT_URL}${endpoint}`,
+          data: claudeBody,
+          headers: {
+            'Authorization': `Bearer ${bearer}`,
+            'AI-Resource-Group': resourceGroup,
+            'Content-Type': 'application/json'
+          }
+        });
+        
+        // Convert Claude response to OpenAI format
+        const openAIResponse = claudeToOpenAI(response.data);
+        res.json(openAIResponse);
+      } catch (nonStreamError) {
+        console.error("Non-streaming error:", nonStreamError.message);
+        
+        // Try to get more detailed error information
+        if (nonStreamError.response) {
+          console.error("Response status:", nonStreamError.response.status);
+          console.error("Response headers:", JSON.stringify(nonStreamError.response.headers, null, 2));
+          console.error("Response data:", nonStreamError.response.data);
+          
+          // Log request that caused the error
+          console.error("Request URL:", `${DEPLOYMENT_URL}${endpoint}`);
+          console.error("Request data:", JSON.stringify(claudeBody, null, 2));
+        }
+        res.status(500).send('Error in non-streaming: ' + nonStreamError.message);
+      }
     }
   } catch (err) {
     console.error('Error:', err.message);
