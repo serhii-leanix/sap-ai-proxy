@@ -84,17 +84,44 @@ function openAIToClaudeMessages(body) {
   // Extract messages from OpenAI format with fallbacks
   const messages = body.messages || [];
   
+  // Convert messages, handling tool messages and function calls
+  const convertedMessages = messages.map(msg => {
+    if (msg.role === 'tool') {
+      // Convert tool message to user message with tool result
+      return {
+        role: 'user',
+        content: [
+          {
+            text: `Tool result for ${msg.name}: ${msg.content}`
+          }
+        ]
+      };
+    } else if (msg.role === 'assistant' && msg.function_call) {
+      // Convert assistant message with function call to assistant message with text
+      return {
+        role: 'assistant',
+        content: [
+          {
+            text: msg.content || `I need to call the ${msg.function_call.name} function with arguments: ${msg.function_call.arguments}`
+          }
+        ]
+      };
+    } else {
+      return {
+        role: msg.role === 'system' ? 'user' : msg.role,
+        content: [
+          {
+            text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+          }
+        ]
+      };
+    }
+  });
+  
   // Convert to format for /converse-stream endpoint
   // This format works with anthropic--claude-3.7-sonnet
   const result = {
-    messages: messages.map(msg => ({
-      role: msg.role === 'system' ? 'user' : msg.role, // Claude might not support 'system' role
-      content: [
-        {
-          text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
-        }
-      ]
-    })),
+    messages: convertedMessages,
     inferenceConfig: {
       maxTokens: body.max_tokens || body.maxTokens || 4096,
       // Only set temperature if explicitly provided, otherwise don't set it
@@ -104,6 +131,38 @@ function openAIToClaudeMessages(body) {
       ...(body.topP !== undefined && { topP: body.topP })
     }
   };
+  
+  // Add tools if functions are provided
+  if (body.functions && Array.isArray(body.functions)) {
+    result.toolConfig = {
+      tools: body.functions.map(func => ({
+        toolSpec: {
+          name: func.name,
+          description: func.description || '',
+          inputSchema: {
+            json: func.parameters || { type: 'object', properties: {} }
+          }
+        }
+      }))
+    };
+    
+    // Handle tool_choice
+    if (body.tool_choice) {
+      if (body.tool_choice === 'none') {
+        // Don't include toolConfig if tools are disabled
+        delete result.toolConfig;
+      } else if (body.tool_choice === 'auto') {
+        result.toolConfig.toolChoice = { auto: {} };
+      } else if (typeof body.tool_choice === 'object' && body.tool_choice.function) {
+        result.toolConfig.toolChoice = {
+          tool: { name: body.tool_choice.function.name }
+        };
+      }
+    } else {
+      // Default to auto
+      result.toolConfig.toolChoice = { auto: {} };
+    }
+  }
   
   // Include any stream options if provided
   if (body.stream_options) {
@@ -118,11 +177,23 @@ function openAIToClaudeMessages(body) {
 ---------------------------------------------------------------------------- */
 function claudeToOpenAI(claudeResponse) {
   let content = '';
+  let functionCall = null;
+  let finishReason = 'stop';
   
   // Safely extract content from Claude response
   try {
     // For /invoke endpoint
     if (claudeResponse.content && Array.isArray(claudeResponse.content)) {
+      // Check for tool use in content
+      const toolUse = claudeResponse.content.find(item => item.type === 'tool_use');
+      if (toolUse) {
+        functionCall = {
+          name: toolUse.name,
+          arguments: JSON.stringify(toolUse.input || {})
+        };
+        finishReason = 'function_call';
+      }
+      
       content = claudeResponse.content
         .filter(item => item.type === 'text')
         .map(item => item.text)
@@ -130,6 +201,16 @@ function claudeToOpenAI(claudeResponse) {
     }
     // For /converse endpoint
     else if (claudeResponse.output?.message?.content) {
+      // Check for tool use in converse response
+      const toolUse = claudeResponse.output.message.content.find(item => item.toolUse);
+      if (toolUse?.toolUse) {
+        functionCall = {
+          name: toolUse.toolUse.name,
+          arguments: JSON.stringify(toolUse.toolUse.input || {})
+        };
+        finishReason = 'function_call';
+      }
+      
       content = claudeResponse.output.message.content
         .filter(item => item.text)
         .map(item => item.text)
@@ -144,6 +225,11 @@ function claudeToOpenAI(claudeResponse) {
     content = "[Error extracting content]";
   }
 
+  const message = { role: 'assistant', content };
+  if (functionCall) {
+    message.function_call = functionCall;
+  }
+
   return {
     id: 'claude-response-' + Date.now(),
     object: 'chat.completion',
@@ -152,8 +238,8 @@ function claudeToOpenAI(claudeResponse) {
     choices: [
       {
         index: 0,
-        message: { role: 'assistant', content },
-        finish_reason: 'stop'
+        message,
+        finish_reason: finishReason
       }
     ],
     usage: {
@@ -173,6 +259,8 @@ function streamClaudeToOpenAI(res, stream) {
   res.setHeader('Connection', 'keep-alive');
 
   let buffer = '';
+  let functionCallBuffer = { name: '', arguments: '' };
+  let isCollectingFunctionCall = false;
   
   stream.on('data', (chunk) => {
     const data = chunk.toString();
@@ -229,6 +317,53 @@ function streamClaudeToOpenAI(res, stream) {
             if (eventData.contentBlockDelta?.delta?.text) {
               // Content block delta with text
               textContent = eventData.contentBlockDelta.delta.text;
+            } else if (eventData.contentBlockStart?.start?.type === 'tool_use') {
+              // Tool use start - begin collecting function call
+              isCollectingFunctionCall = true;
+              functionCallBuffer.name = eventData.contentBlockStart.start.name || '';
+              functionCallBuffer.arguments = '';
+              
+              // Send function call start
+              const chunk = {
+                id: 'claude-stream-' + Date.now(),
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: 'claude-3.7-sonnet',
+                choices: [{
+                  index: 0,
+                  delta: {
+                    function_call: { name: functionCallBuffer.name }
+                  },
+                  finish_reason: null
+                }]
+              };
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              continue;
+            } else if (eventData.contentBlockDelta?.delta?.partial_json && isCollectingFunctionCall) {
+              // Tool use input delta - accumulate function arguments
+              const argFragment = eventData.contentBlockDelta.delta.partial_json;
+              functionCallBuffer.arguments += argFragment;
+              
+              // Send function call arguments fragment
+              const chunk = {
+                id: 'claude-stream-' + Date.now(),
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: 'claude-3.7-sonnet',
+                choices: [{
+                  index: 0,
+                  delta: {
+                    function_call: { arguments: argFragment }
+                  },
+                  finish_reason: null
+                }]
+              };
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              continue;
+            } else if (eventData.contentBlockStop && isCollectingFunctionCall) {
+              // Tool use end - finish function call
+              isCollectingFunctionCall = false;
+              stopReason = 'function_call';
             } else if (eventData.messageStart) {
               // Message start event - send an empty delta to start
               const chunk = {
@@ -246,7 +381,9 @@ function streamClaudeToOpenAI(res, stream) {
               continue;
             } else if (eventData.messageStop) {
               // Message stop event
-              stopReason = 'stop';
+              if (!isCollectingFunctionCall) {
+                stopReason = 'stop';
+              }
             } else if (eventData.metadata && eventData.metadata.usage) {
               // Metadata event with usage info
               usage = {
